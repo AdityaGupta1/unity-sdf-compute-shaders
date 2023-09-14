@@ -155,14 +155,12 @@ void GenerateVoxels (uint3 id : SV_DispatchThreadID, uint3 localId : SV_GroupThr
             ctrlPts[0] = 0;
             for (int i = 1; i < CONTROL_POINTS; ++i) {
                 random = rand(random);
-                //ctrlPts[i] = (endPoint * i / lastCtrlPtIndex) + ((random * 2 - 1) * float3(6, 2, 6));
-                ctrlPts[i] = (endPoint * i / lastCtrlPtIndex) + ((random * 2 - 1) * float3(2, 1, 2));
+                ctrlPts[i] = (endPoint * i / lastCtrlPtIndex) + ((random * 2 - 1) * float3(6, 2, 6));
             }
 
             const int lastSplineIndex = SPLINE_SIZE - 1;
             float3 spline[SPLINE_SIZE];
             for (int i = 0; i < SPLINE_SIZE; ++i) {
-                /*
                 float3 ctrlPtsCopy[CONTROL_POINTS] = ctrlPts;
                 int points = CONTROL_POINTS;
 
@@ -177,8 +175,6 @@ void GenerateVoxels (uint3 id : SV_DispatchThreadID, uint3 localId : SV_GroupThr
                 }
 
                 spline[i] = ctrlPtsCopy[0];
-                */
-                spline[i] = ctrlPts[i];
             }
 
             random = rand(random);
