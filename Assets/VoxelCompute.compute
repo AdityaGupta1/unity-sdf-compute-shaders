@@ -1,0 +1,233 @@
+#pragma kernel GenerateVoxels
+
+#define bAIR 0
+#define bSTONE 1
+#define bSTICK 2
+#define bCANDY 3
+
+#define sSPHERE 0
+#define sLOLLIPOP 1
+#define sMUSHROOM 2
+
+struct SdfInfo {
+    int type;
+    int3 pos;
+};
+
+RWStructuredBuffer<int> blocks;
+RWStructuredBuffer<SdfInfo> sdfInfos;
+groupshared SdfInfo sharedSdfInfos[256]; // using this seems to provide a 2-4% speedup
+int numSdfs;
+
+int xSize;
+int ySize;
+int zSize;
+
+// ===========================================
+// random
+// ===========================================
+
+float rand(float v) {
+    return frac(sin(v * 51729.34022));
+}
+
+float3 rand(float3 v) {
+    return frac(sin(float3(
+            dot(v, float3(517.293, 862.104, 349.768)),
+            dot(v, float3(284.921, 735.613, 492.317)),
+            dot(v, float3(618.204, 143.892, 957.123))
+        )) * 40422.29368);
+}
+
+// ===========================================
+// SDFs
+// ===========================================
+
+float sdSphere(float3 p, float s) {
+    return length(p) - s;
+}
+
+float sdBox(float3 p, float3 b) {
+  float3 q = abs(p) - b;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+float sdCappedCylinder(float3 p, float h, float r) {
+  float2 d = abs(float2(length(p.xz), p.y)) - float2(r, h);
+  return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+float sdVerticalCapsule(float3 p, float h, float r) {
+  p.y -= clamp(p.y, 0.0, h);
+  return length(p) - r;
+}
+
+float opUnion(float d1, float d2) { 
+    return min(d1, d2); 
+}
+
+float opSmoothUnion(float d1, float d2, float k) {
+    float h = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    return lerp(d2, d1, h) - k * h * (1.0 - h);
+}
+
+// ===========================================
+// transformations
+// ===========================================
+
+// UNTESTED (half written by ChatGPT)
+/*
+// transforms pos into coordinate system based at origin with look on the positive y-axis
+float3 toPosAndAngle(float3 pos, float3 origin, float3 look) {
+    float3 dir = normalize(look - origin);
+    float3 axis = normalize(cross(float3(0, 1, 0), dir));
+
+    float cosAngle = dot(float3(0, 1, 0), dir);
+    float sinAngle = length(cross(float3(0, 1, 0), dir));
+    float3x3 rotationMatrix = float3x3(
+        cosAngle + axis.x * axis.x * (1 - cosAngle),
+        axis.x * axis.y * (1 - cosAngle) - axis.z * sinAngle,
+        axis.x * axis.z * (1 - cosAngle) + axis.y * sinAngle,
+
+        axis.y * axis.x * (1 - cosAngle) + axis.z * sinAngle,
+        cosAngle + axis.y * axis.y * (1 - cosAngle),
+        axis.y * axis.z * (1 - cosAngle) - axis.x * sinAngle,
+
+        axis.z * axis.x * (1 - cosAngle) - axis.y * sinAngle,
+        axis.z * axis.y * (1 - cosAngle) + axis.x * sinAngle,
+        cosAngle + axis.z * axis.z * (1 - cosAngle)
+    );
+
+    return mul(rotationMatrix, pos - origin);
+}
+*/
+
+#define CONTROL_POINTS 5
+#define SPLINE_SIZE 5
+
+[numthreads(16, 16, 4)]
+void GenerateVoxels (uint3 id : SV_DispatchThreadID, uint3 localId : SV_GroupThreadID) {
+    if (localId.z == 0) {
+        uint sdfIdx = localId.x + localId.y * 16;
+        sharedSdfInfos[sdfIdx] = sdfInfos[sdfIdx];
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    uint index = id.x + id.z * xSize + id.y * xSize * zSize;
+
+    for (int iSdf = 0; iSdf < numSdfs; ++iSdf) {
+        SdfInfo sdfInfo = sharedSdfInfos[iSdf];
+        
+        float3 pos = float3(id) - sdfInfo.pos;
+        float3 random = rand(sdfInfo.pos);
+
+        int blockType = bAIR;
+
+        if (sdfInfo.type == sSPHERE) {
+            float sphereSdf = sdSphere(pos, 10);
+
+            if (sphereSdf < 0) {
+                blockType = bSTONE;
+            }
+        } else if (sdfInfo.type == sLOLLIPOP) {
+            float stickHeight = 35 + 15 * random.x;
+            float stickRadius = 2.5;
+            float stickSdf = sdCappedCylinder(pos - float3(0, stickHeight / 2 - 1, 0), stickHeight / 2, stickRadius);
+
+            float ballRadius = 9 + 3 * random.y;
+            float ballSdf = sdSphere(pos - float3(0, stickHeight, 0), ballRadius);
+
+            float finalSdf = opUnion(stickSdf, ballSdf);
+            if (finalSdf < 0) {
+                blockType = ballSdf < 0 ? bCANDY : bSTICK;
+            }
+        } else if (sdfInfo.type == sMUSHROOM) {
+            float height = 33 + random.x * 40;
+
+            if (pos.y < -1 || pos.y > height + 12 || (length(float2(pos.x, pos.z)) > 8 && (pos.y < height - 12 || length(pos - float3(0, height, 0)) > 35))) {
+                continue;
+            }
+
+            float3 endPoint = float3(0, height, 0);
+            float3 ctrlPts[CONTROL_POINTS];
+            const float lastCtrlPtIndex = CONTROL_POINTS - 1;
+            ctrlPts[0] = 0;
+            for (int i = 1; i < CONTROL_POINTS; ++i) {
+                random = rand(random);
+                //ctrlPts[i] = (endPoint * i / lastCtrlPtIndex) + ((random * 2 - 1) * float3(6, 2, 6));
+                ctrlPts[i] = (endPoint * i / lastCtrlPtIndex) + ((random * 2 - 1) * float3(2, 1, 2));
+            }
+
+            const int lastSplineIndex = SPLINE_SIZE - 1;
+            float3 spline[SPLINE_SIZE];
+            for (int i = 0; i < SPLINE_SIZE; ++i) {
+                /*
+                float3 ctrlPtsCopy[CONTROL_POINTS] = ctrlPts;
+                int points = CONTROL_POINTS;
+
+                float t = float(i) / lastSplineIndex;
+
+                while (points > 1) {
+                    for (int j = 0; j < points - 1; ++j) {
+                        ctrlPtsCopy[j] = lerp(ctrlPtsCopy[j], ctrlPtsCopy[j + 1], t);
+                    }
+
+                    --points;
+                }
+
+                spline[i] = ctrlPtsCopy[0];
+                */
+                spline[i] = ctrlPts[i];
+            }
+
+            random = rand(random);
+
+            for (int i = 0; i < SPLINE_SIZE; ++i) {
+                float3 pos1 = spline[i];
+                float3 pos2;
+
+                if (i < lastSplineIndex) {
+                    pos2 = spline[i + 1];
+
+                    if (pos.y < pos1.y - 3 || pos.y > pos2.y + 3) {
+                        continue;
+                    }
+                } else {
+                    pos2 = pos1 + normalize(pos1 - spline[i - 1]) * mad(0.5, random.x, 2.5);
+                }
+                
+                float3 vecLine = pos2 - pos1;
+
+                float3 pointPos = pos - pos1;
+                float ratio = dot(pointPos, vecLine) / dot(vecLine, vecLine);
+
+                float3 pointLine = vecLine * ratio;
+                float3 vecPointPos = pointPos - pointLine;
+
+                float radius;
+                int potentialBlockType;
+                if (i < lastSplineIndex) {
+                    float t = (i + saturate(ratio)) / lastSplineIndex;
+                    float x = t - 0.5;
+                    radius = 4 * x * x + 1.5;
+                    potentialBlockType = bSTICK;
+                } else {
+                    radius = mad(7, random.y, 14) * lerp(0.8, 1.2, (height - 33) / 40); 
+                    potentialBlockType = bCANDY;
+                }
+
+                if ((ratio >= 0 && ratio <= 1 && length(vecPointPos) <= radius) || (i < lastSplineIndex && ratio < 0 && distance(pos, pos1) < radius) || (i < (SPLINE_SIZE - 2) && ratio > 1 && distance(pos, pos2) < radius)) {
+                    blockType = potentialBlockType;
+                    break;
+                }
+            }
+        }
+
+        // early exit on first feature which actually sets the block
+        if (blockType != bAIR) {
+            blocks[index] = blockType;
+            return;
+        }
+    }
+}
